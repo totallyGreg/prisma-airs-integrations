@@ -66,10 +66,10 @@ Create a gRPC service implementing the Envoy `envoy.service.ext_proc.v3.External
 
 #### Service Features
 - **gRPC ext_proc endpoint**: Bidirectional streaming for request/response processing
-- **Request body buffering**: Accumulate streaming body chunks until `end_of_stream`
+- **Request body buffering**: Accumulate streaming body chunks until `end_of_stream`, enforcing a configurable `MAX_BODY_SIZE` (default 4MB) to prevent memory exhaustion
 - **Prompt extraction**: Parse AI prompts from common formats (OpenAI, Anthropic, Gemini, Vertex AI)
 - **Prisma AIRS client**: Call scan API with `X-Pan-Token` authentication
-- **Response scanning**: Optional scanning of LLM responses for sensitive data
+- **Response scanning**: Optional scanning of LLM responses for sensitive data (non-streaming only; see Limitations)
 - **Immediate responses**: Return structured block responses with scan details
 
 #### agentgateway ExtProc Differences
@@ -124,20 +124,30 @@ func (s *AIRSExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServ
             stream.Send(continueHeadersResponse())
 
         case *extproc.ProcessingRequest_RequestBody:
-            // Accumulate body chunks (agentgateway always streams)
+            // Enforce body size limit to prevent memory exhaustion
+            if requestBody.Len()+len(r.RequestBody.Body) > s.config.MaxBodySize {
+                stream.Send(immediateErrorResponse("Request body too large for security scanning"))
+                return nil
+            }
             requestBody.Write(r.RequestBody.Body)
 
             if r.RequestBody.EndOfStream {
                 // Full body received - extract prompt and scan
                 prompt := s.promptExtractor.Extract(&requestBody)
-                verdict, err := s.airsClient.ScanPrompt(correlationID, prompt)
+                verdict, err := s.airsClient.ScanPrompt(stream.Context(), correlationID, prompt)
 
-                if err != nil && s.config.FailClosed {
-                    stream.Send(immediateErrorResponse("AIRS unavailable"))
+                if err != nil {
+                    if s.config.FailClosed {
+                        stream.Send(immediateErrorResponse("AIRS unavailable"))
+                        return nil
+                    }
+                    // Fail-open: allow request through when AIRS is unreachable
+                    stream.Send(continueBodyResponse())
                     return nil
                 }
 
-                if verdict.Action == "block" {
+                // Allowlist approach: only "allow" passes through, everything else blocks
+                if verdict.Action != "allow" {
                     stream.Send(immediateBlockResponse(verdict))
                     return nil
                 }
@@ -149,10 +159,9 @@ func (s *AIRSExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServ
             stream.Send(continueHeadersResponse())
 
         case *extproc.ProcessingRequest_ResponseBody:
-            // Optional: Scan LLM response for sensitive data leakage
-            if s.config.ScanResponses {
-                // Similar pattern to request scanning
-            }
+            // Response scanning is stubbed for MVP. When enabled, it will only
+            // work with non-streaming (stream: false) LLM responses. Streaming
+            // SSE responses pass through without scanning. See Limitations.
             stream.Send(continueBodyResponse())
         }
     }
@@ -170,7 +179,29 @@ type AIRSClient struct {
     httpClient *http.Client
 }
 
-func (c *AIRSClient) ScanPrompt(trID string, prompt string) (*ScanResult, error) {
+// NewAIRSClient creates a client with a properly configured HTTP transport.
+// MaxIdleConnsPerHost is set to 20 (default is 2) since all calls go to the
+// same AIRS host. Without this, concurrent requests open new TCP+TLS
+// connections, adding 100-300ms of latency per request.
+func NewAIRSClient(cfg Config) *AIRSClient {
+    return &AIRSClient{
+        endpoint: cfg.AIRSEndpoint,
+        apiKey:   cfg.AIRSAPIKey,
+        profile:  cfg.ProfileName,
+        appName:  cfg.AppName,
+        httpClient: &http.Client{
+            Timeout: cfg.RequestTimeout,
+            Transport: &http.Transport{
+                MaxIdleConns:        100,
+                MaxIdleConnsPerHost: 20,
+                IdleConnTimeout:     90 * time.Second,
+                TLSHandshakeTimeout: 5 * time.Second,
+            },
+        },
+    }
+}
+
+func (c *AIRSClient) ScanPrompt(ctx context.Context, trID string, prompt string) (*ScanResult, error) {
     payload := map[string]interface{}{
         "tr_id": trID,
         "ai_profile": map[string]string{
@@ -185,8 +216,16 @@ func (c *AIRSClient) ScanPrompt(trID string, prompt string) (*ScanResult, error)
         },
     }
 
-    body, _ := json.Marshal(payload)
-    req, _ := http.NewRequest("POST", c.endpoint, bytes.NewReader(body))
+    body, err := json.Marshal(payload)
+    if err != nil {
+        return nil, fmt.Errorf("failed to marshal scan request: %w", err)
+    }
+
+    // Use stream context so the AIRS call is cancelled if the client disconnects
+    req, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
+    if err != nil {
+        return nil, fmt.Errorf("failed to create AIRS request: %w", err)
+    }
 
     // AIRS authentication - simple API key header
     req.Header.Set("X-Pan-Token", c.apiKey)
@@ -198,8 +237,25 @@ func (c *AIRSClient) ScanPrompt(trID string, prompt string) (*ScanResult, error)
     }
     defer resp.Body.Close()
 
+    // Validate HTTP status -- non-200 responses must be treated as errors.
+    // Without this check, a 401 (bad key), 429 (rate limited), or 500 (server error)
+    // would be silently parsed as a zero-value ScanResult, potentially allowing
+    // malicious prompts through unscanned.
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("AIRS API returned non-200 status: %d", resp.StatusCode)
+    }
+
     var result ScanResult
-    json.NewDecoder(resp.Body).Decode(&result)
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, fmt.Errorf("failed to decode AIRS response: %w", err)
+    }
+
+    // Validate that the action field is present. If AIRS returns an unexpected
+    // response shape, treat it as a block for fail-closed safety.
+    if result.Action == "" {
+        return nil, fmt.Errorf("AIRS response missing 'action' field")
+    }
+
     return &result, nil
 }
 ```
@@ -257,6 +313,7 @@ LISTEN_GRPC_PORT: "50051"
 REQUEST_TIMEOUT: "5s"
 FAIL_CLOSED: "true"
 SCAN_RESPONSES: "false"
+MAX_BODY_SIZE: "4194304"   # 4MB - prevents OOM from large payloads
 ```
 
 #### AIRS Scan Payload Format
@@ -329,6 +386,7 @@ data:
   REQUEST_TIMEOUT: "5s"
   FAIL_CLOSED: "true"
   SCAN_RESPONSES: "false"
+  MAX_BODY_SIZE: "4194304"
 ```
 
 #### 2.4 Deployment
@@ -775,6 +833,8 @@ gateway-api/
 | `backends required DNS resolution which failed` | Backend hostname not resolvable | Use `host.internal` for OrbStack |
 | 401 from AIRS API | Invalid API key | Verify secret contains valid `X-Pan-Token` value |
 | Empty body in ExtProc | Body not buffered correctly | Ensure handling `end_of_stream` flag |
+| `Request body too large` error | Payload exceeds `MAX_BODY_SIZE` | Increase `MAX_BODY_SIZE` or reduce prompt size |
+| AIRS API returns non-200 | Invalid API key, rate limited, or server error | Check AIRS API key, profile, and rate limits |
 
 ### Debug Commands
 
@@ -845,12 +905,18 @@ The ExtProc service handles AIRS authentication internally using `X-Pan-Token` h
 - ✅ Service correctly buffers streaming body and extracts prompts
 - ✅ AIRS API called with proper `X-Pan-Token` authentication
 - ✅ Malicious prompts blocked with 403 and structured JSON response
-- ✅ Benign requests pass through with <500ms additional latency
-- ✅ Response scanning supported (optional configuration)
+- ✅ Benign requests pass through with minimal additional latency (excluding AIRS API round-trip)
+- ✅ Response scanning stubbed with config flag (MVP scans requests only; see Limitations)
 - ✅ Fail-closed mode blocks requests when ExtProc/AIRS unavailable
 - ✅ Works with agentgateway ExtProc policy
 - ✅ Documentation matches quality/style of existing integrations
 - ✅ Deployment automated via manifests or script
+
+## Limitations
+
+- **Response scanning does not support streaming (SSE) responses.** Most LLM APIs default to `stream: true`, returning Server-Sent Events. Buffering an entire streaming response before scanning would defeat the purpose of streaming (time-to-first-token) and consume significant memory over long responses. Response scanning will only work with non-streaming (`stream: false`) requests. Streaming responses pass through ExtProc without scanning.
+- **Request body size is capped at `MAX_BODY_SIZE` (default 4MB).** Requests exceeding this limit are rejected with an error response to prevent memory exhaustion. This aligns with gRPC-Go's default `MaxRecvMsgSize` of 4MB.
+- **Total latency depends on AIRS API response time.** The ExtProc processing overhead (gRPC streaming, JSON parsing, response construction) is minimal. The dominant latency cost is the synchronous AIRS scan API call, which has a configurable timeout of 5 seconds. The Kong plugin uses the same 5-second timeout.
 
 ## Future Enhancements
 
