@@ -106,6 +106,7 @@ gateway-api/extproc-service/
 func (s *AIRSExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServer) error {
     var requestBody bytes.Buffer
     var correlationID string
+    var appUser string
 
     for {
         req, err := stream.Recv()
@@ -118,8 +119,9 @@ func (s *AIRSExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServ
 
         switch r := req.Request.(type) {
         case *extproc.ProcessingRequest_RequestHeaders:
-            // Extract correlation ID from headers
+            // Extract correlation ID and app user from headers
             correlationID = extractCorrelationID(r.RequestHeaders)
+            appUser = extractAppUser(r.RequestHeaders) // :authority or route name, fallback "agentgateway-user"
             // Continue to receive body
             stream.Send(continueHeadersResponse())
 
@@ -134,7 +136,7 @@ func (s *AIRSExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServ
             if r.RequestBody.EndOfStream {
                 // Full body received - extract prompt and scan
                 prompt := s.promptExtractor.Extract(&requestBody)
-                verdict, err := s.airsClient.ScanPrompt(stream.Context(), correlationID, prompt)
+                verdict, err := s.airsClient.ScanPrompt(stream.Context(), correlationID, prompt, appUser)
 
                 if err != nil {
                     if s.config.FailClosed {
@@ -201,7 +203,12 @@ func NewAIRSClient(cfg Config) *AIRSClient {
     }
 }
 
-func (c *AIRSClient) ScanPrompt(ctx context.Context, trID string, prompt string) (*ScanResult, error) {
+// ScanPrompt sends the prompt to AIRS for scanning.
+// appUser identifies the request source in AIRS logs -- extracted from the
+// :authority header or route name in the request headers phase, falling back
+// to "agentgateway-user". This differentiates app_user from app_name,
+// matching how Kong uses the service name and Apigee uses "apigee-user".
+func (c *AIRSClient) ScanPrompt(ctx context.Context, trID string, prompt string, appUser string) (*ScanResult, error) {
     payload := map[string]interface{}{
         "tr_id": trID,
         "ai_profile": map[string]string{
@@ -209,7 +216,7 @@ func (c *AIRSClient) ScanPrompt(ctx context.Context, trID string, prompt string)
         },
         "metadata": map[string]string{
             "app_name": c.appName,
-            "app_user": "agentgateway",
+            "app_user": appUser,
         },
         "contents": []map[string]string{
             {"prompt": prompt},
@@ -486,6 +493,50 @@ metadata:
   namespace: prisma-airs
 ```
 
+#### 2.7 NetworkPolicy
+`networkpolicy.yaml` - Restrict network access to and from ExtProc pods
+
+Without a NetworkPolicy, any pod in the cluster can connect to the ExtProc gRPC service on port 50051 and intercept AI/LLM traffic. This policy restricts ingress to only the agentgateway namespace and egress to only the AIRS API (HTTPS/443) and DNS.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: airs-extproc-netpol
+  namespace: prisma-airs
+spec:
+  podSelector:
+    matchLabels:
+      app: airs-extproc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kgateway-system
+    ports:
+    - port: 50051
+      protocol: TCP
+  egress:
+  # Allow outbound HTTPS to AIRS API
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - port: 443
+      protocol: TCP
+  # Allow DNS resolution
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+```
+
 ### Phase 3: agentgateway Configuration
 **Location:** `gateway-api/examples/`
 
@@ -701,7 +752,9 @@ and agentgateway's External Processing (ExtProc) capability.
 ## Security Considerations
 - API key stored in Kubernetes Secret
 - Fail-closed by default
-- TLS for AIRS API calls
+- TLS for outbound AIRS API calls
+- NetworkPolicy restricts ingress to agentgateway namespace only
+- **gRPC channel encryption**: The ExtProc gRPC channel between agentgateway and the ExtProc service carries full request/response bodies including prompts and LLM outputs. In production, enable mTLS on this channel via a service mesh (Istio, Linkerd) or by configuring TLS certificates directly on the gRPC server. Without encryption, any pod with network access can intercept AI traffic in plaintext.
 
 ## References
 [Links to Gateway API, AIRS docs, agentgateway docs]
@@ -806,6 +859,7 @@ gateway-api/
 │   ├── deployment.yaml
 │   ├── service.yaml
 │   ├── serviceaccount.yaml
+│   ├── networkpolicy.yaml
 │   └── kustomization.yaml
 ├── examples/                        # Configuration examples
 │   ├── agentgateway-config.yaml     # Complete agentgateway config
@@ -894,6 +948,35 @@ ExtProc enables dual-phase scanning (request + response) in a single service, wh
 - If ExtProc or AIRS API is unreachable, block requests by default
 - Configurable via `failureMode` in agentgateway policy
 - Consistent with other integration patterns (Kong, Apigee)
+
+### gRPC Channel Security
+
+The gRPC channel between agentgateway and the ExtProc service carries sensitive AI traffic (prompts, responses, PII). In production deployments:
+
+- **With a service mesh** (Istio, Linkerd): mTLS is automatic — no code changes needed
+- **Without a service mesh**: Configure TLS certificates on the gRPC server and update the agentgateway ExtProc backend to use TLS
+- **Development/OrbStack**: Plaintext is acceptable for local testing
+
+The NetworkPolicy in `manifests/networkpolicy.yaml` provides defense-in-depth by restricting which pods can reach the ExtProc service, even without TLS.
+
+### Block Response: HTTP 403 and OpenAI Error Format
+
+Block responses use HTTP 403 (Forbidden), matching the Kong plugin. The Apigee integration uses HTTP 400 (Bad Request). HTTP 403 is more semantically correct for a security policy block — the request is understood but denied by policy, not malformed.
+
+The response body follows the OpenAI error response format (`{"error": {"message": ..., "type": ..., "code": ...}}`). This is intentional: since the gateway proxies to OpenAI-compatible backends, LLM client SDKs can parse block responses using their standard error handling. Kong and Apigee use flat response structures, but those integrations are not typically consumed by LLM SDKs directly.
+
+### Response Scanning Payload
+
+When response scanning is implemented (post-MVP), the scan payload will include both the original prompt and the LLM response together, matching the Kong plugin's pattern. This provides better detection context for AIRS than sending the response alone (as Apigee and Claude Code hooks do).
+
+```json
+{
+  "contents": [{
+    "prompt": "<original-user-prompt>",
+    "response": "<llm-response-text>"
+  }]
+}
+```
 
 ### AIRS Authentication Pattern
 
